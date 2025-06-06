@@ -1,4 +1,3 @@
-// internal/layer3/traceroute.go
 package layer3
 
 import (

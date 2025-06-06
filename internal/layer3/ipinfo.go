@@ -1,4 +1,3 @@
-// internal/layer3/ipinfo.go
 package layer3
 
 import (

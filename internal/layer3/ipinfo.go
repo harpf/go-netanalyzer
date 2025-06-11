@@ -1,45 +1,72 @@
 package layer3
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 
 	"github.com/spf13/cobra"
 )
 
 func NewIPInfoCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "ipinfo [ip-address]",
-		Short: "Inspect details of an IP address (Layer 3)",
-		Long: `Parses and displays detailed information about an IP address.
-Includes address family, whether it's loopback, multicast, private, and global unicast.
+		Use:   "ipinfo [ip-addresses...]",
+		Short: "Inspect details of one or more IP addresses (Layer 3)",
+		Long: `Parses and displays detailed information about one or more IP addresses.
+Supports IPv4 and IPv6. Output includes address family, loopback, multicast, private, and global unicast flags.
 
 Arguments:
-  ip-address - The IPv4 or IPv6 address to inspect`,
+  ip-address - One or more IPv4 or IPv6 addresses`,
 		Example: `
-  netanalyzer ipinfo 192.168.1.1
-  netanalyzer ipinfo 8.8.8.8`,
-		Args: cobra.ExactArgs(1),
+  netanalyzer ipinfo 8.8.8.8 192.168.1.1
+  netanalyzer ipinfo ::1 fe80::1`,
+		Args: cobra.MinimumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
-			RunIPInfo(args[0])
+			RunIPInfoMultiple(args)
 		},
 	}
 }
 
-func RunIPInfo(input string) {
-	ip := net.ParseIP(input)
-	if ip == nil {
-		fmt.Println("Invalid IP address")
+type IPInfo struct {
+	IP              string `json:"ip"`
+	AddressFamily   string `json:"address_family"`
+	IsLoopback      bool   `json:"is_loopback"`
+	IsMulticast     bool   `json:"is_multicast"`
+	IsUnspecified   bool   `json:"is_unspecified"`
+	IsGlobalUnicast bool   `json:"is_global_unicast"`
+	IsPrivate       bool   `json:"is_private"`
+}
+
+func RunIPInfoMultiple(inputs []string) {
+	var results []IPInfo
+
+	for _, input := range inputs {
+		ip := net.ParseIP(input)
+		if ip == nil {
+			fmt.Fprintf(os.Stderr, "Invalid IP address: %s\n", input)
+			continue
+		}
+
+		result := IPInfo{
+			IP:              ip.String(),
+			AddressFamily:   getIPFamily(ip),
+			IsLoopback:      ip.IsLoopback(),
+			IsMulticast:     ip.IsMulticast(),
+			IsUnspecified:   ip.IsUnspecified(),
+			IsGlobalUnicast: ip.IsGlobalUnicast(),
+			IsPrivate:       isPrivateIP(ip),
+		}
+		results = append(results, result)
+	}
+
+	jsonBytes, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		fmt.Println("Error serializing results:", err)
 		return
 	}
 
-	fmt.Printf("Analyzing IP: %s\n", ip)
-	fmt.Printf("  Address Family: %s\n", getIPFamily(ip))
-	fmt.Printf("  Is Loopback: %v\n", ip.IsLoopback())
-	fmt.Printf("  Is Multicast: %v\n", ip.IsMulticast())
-	fmt.Printf("  Is Unspecified: %v\n", ip.IsUnspecified())
-	fmt.Printf("  Is Global Unicast: %v\n", ip.IsGlobalUnicast())
-	fmt.Printf("  Is Private: %v\n", isPrivateIP(ip))
+	fmt.Println(string(jsonBytes))
 }
 
 func getIPFamily(ip net.IP) string {

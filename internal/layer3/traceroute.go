@@ -1,53 +1,143 @@
 package layer3
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
-func NewTracerouteCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "traceroute [host]",
-		Short: "Perform a traceroute to a host (Layer 3)",
-		Long: `Sends ICMP echo requests with increasing TTL to trace the path to the destination host.
-Requires administrative privileges to open raw sockets.
-
-Arguments:
-  host  - Target IP address or hostname`,
-		Example: `
-  netanalyzer traceroute 8.8.8.8`,
-		Args: cobra.ExactArgs(1),
-		Run: func(cmd *cobra.Command, args []string) {
-			target := args[0]
-			RunTraceroute(target, 30)
-		},
-	}
+type HopResult struct {
+	TTL        int           `json:"ttl"`
+	Address    string        `json:"address"`
+	Hostname   string        `json:"hostname"`
+	Duration   time.Duration `json:"duration"`
+	Success    bool          `json:"success"`
+	Type       string        `json:"type"`
+	ICMPType   string        `json:"icmp_type"`
+	RawMessage []byte        `json:"raw_message,omitempty"`
 }
 
-func RunTraceroute(target string, maxHops int) {
-	ipAddr, err := net.ResolveIPAddr("ip4", target)
-	if err != nil {
-		fmt.Println("Resolve error:", err)
-		return
+type TracerouteResult struct {
+	Target string      `json:"target"`
+	Hops   []HopResult `json:"hops"`
+}
+
+func NewTracerouteCommand() *cobra.Command {
+	var maxHops int
+	var ipv6Mode bool
+	var jsonOutput bool
+
+	cmd := &cobra.Command{
+		Use:   "traceroute [host]...",
+		Short: "Perform a traceroute to one or more hosts (Layer 3)",
+		Long: `Sends ICMP echo requests with increasing TTL to trace the path to the destination host.
+Supports both IPv4 and IPv6. Requires administrative privileges to open raw sockets.
+
+Each host is traced in parallel. Results can be printed in plain text or JSON format.
+Each hop includes hostname, RTT, ICMP type and response details.`,
+		Example: `
+  netanalyzer traceroute 8.8.8.8
+  netanalyzer traceroute example.com --ipv6
+  netanalyzer traceroute 1.1.1.1 8.8.8.8 --json`,
+		Args: cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			var wg sync.WaitGroup
+			results := make([]TracerouteResult, len(args))
+			mutex := sync.Mutex{}
+
+			wg.Add(len(args))
+			for i, target := range args {
+				go func(i int, target string) {
+					defer wg.Done()
+					hops := RunTraceroute(target, maxHops, ipv6Mode)
+					mutex.Lock()
+					results[i] = TracerouteResult{Target: target, Hops: hops}
+					mutex.Unlock()
+				}(i, target)
+			}
+			wg.Wait()
+
+			if jsonOutput {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				_ = enc.Encode(results)
+			} else {
+				for _, res := range results {
+					fmt.Printf("\nTraceroute to %s:\n", res.Target)
+					for _, hop := range res.Hops {
+						if hop.Success {
+							fmt.Printf("%2d  %-40s  %v\n", hop.TTL, fmt.Sprintf("%s (%s)", hop.Hostname, hop.Address), hop.Duration)
+						} else {
+							fmt.Printf("%2d  * * *\n", hop.TTL)
+						}
+					}
+				}
+			}
+		},
 	}
 
+	cmd.Flags().IntVar(&maxHops, "maxhops", 30, "Maximum number of hops")
+	cmd.Flags().BoolVar(&ipv6Mode, "ipv6", false, "Use IPv6 instead of IPv4")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output results as JSON")
+	return cmd
+}
+
+func RunTraceroute(target string, maxHops int, ipv6Mode bool) []HopResult {
+	var (
+		icmpType     icmp.Type
+		replyType    icmp.Type
+		network      string
+		listenAddr   string
+		proto        int
+		protocolType string
+	)
+
+	if ipv6Mode {
+		icmpType = ipv6.ICMPTypeEchoRequest
+		replyType = ipv6.ICMPTypeEchoReply
+		network = "ip6:ipv6-icmp"
+		listenAddr = "::"
+		proto = 58
+		protocolType = "IPv6"
+	} else {
+		icmpType = ipv4.ICMPTypeEcho
+		replyType = ipv4.ICMPTypeEchoReply
+		network = "ip4:icmp"
+		listenAddr = "0.0.0.0"
+		proto = 1
+		protocolType = "IPv4"
+	}
+
+	ipAddr, err := net.ResolveIPAddr("ip", target)
+	if err != nil {
+		return []HopResult{{TTL: 1, Address: "resolve error", Success: false, Type: protocolType}}
+	}
+
+	var results []HopResult
 	for ttl := 1; ttl <= maxHops; ttl++ {
-		conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+		conn, err := icmp.ListenPacket(network, listenAddr)
 		if err != nil {
-			fmt.Println("Listen error:", err)
-			return
+			results = append(results, HopResult{TTL: ttl, Address: "listen error", Success: false, Type: protocolType})
+			continue
 		}
-		pconn := conn.IPv4PacketConn()
-		_ = pconn.SetTTL(ttl)
+
+		if ipv6Mode {
+			_ = conn.IPv6PacketConn().SetHopLimit(ttl)
+		} else {
+			_ = conn.IPv4PacketConn().SetTTL(ttl)
+		}
 		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 		msg := icmp.Message{
-			Type: ipv4.ICMPTypeEcho,
+			Type: icmpType,
 			Code: 0,
 			Body: &icmp.Echo{
 				ID:   ttl,
@@ -62,19 +152,45 @@ func RunTraceroute(target string, maxHops int) {
 		buffer := make([]byte, 1500)
 		n, peer, err := conn.ReadFrom(buffer)
 		duration := time.Since(start)
+		_ = conn.Close()
+
+		hostname := ""
+		if err == nil {
+			addrs, _ := net.LookupAddr(peer.String())
+			if len(addrs) > 0 {
+				hostname = addrs[0]
+			}
+		}
 
 		if err != nil {
-			fmt.Printf("%2d  * * *\n", ttl)
-			_ = conn.Close()
+			results = append(results, HopResult{TTL: ttl, Address: "*", Hostname: "", Success: false, Type: protocolType})
 			continue
 		}
 
-		resp, _ := icmp.ParseMessage(1, buffer[:n])
-		fmt.Printf("%2d  %s  %v\n", ttl, peer.String(), duration)
-		_ = conn.Close()
+		resp, _ := icmp.ParseMessage(proto, buffer[:n])
+		results = append(results, HopResult{
+			TTL:      ttl,
+			Address:  peer.String(),
+			Hostname: hostname,
+			Duration: duration,
+			Success:  true,
+			Type:     protocolType,
+			ICMPType: func() string {
+				switch t := resp.Type.(type) {
+				case ipv4.ICMPType:
+					return t.String()
+				case ipv6.ICMPType:
+					return t.String()
+				default:
+					return fmt.Sprintf("%v", t)
+				}
+			}(),
+			RawMessage: buffer[:n],
+		})
 
-		if resp.Type == ipv4.ICMPTypeEchoReply {
+		if resp.Type == replyType {
 			break
 		}
 	}
+	return results
 }
